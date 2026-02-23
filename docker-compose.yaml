@@ -1,0 +1,34 @@
+name: utel
+
+services:
+  asterisk:
+    image: ghcr.io/abdullayevbahrom/asterisk:22
+    container_name: asterisk
+    restart: "no"
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "8088:8088/tcp"
+      - "10000-10100:10000-10100/udp"
+    volumes:
+      - ./asterisk/ari.conf:/etc/asterisk/ari.conf
+      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf
+      - ./asterisk/http.conf:/etc/asterisk/http.conf
+      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf
+      - ./asterisk/rtp.conf:/etc/asterisk/rtp.conf
+      - ./asterisk/logs/messages.log:/var/log/asterisk/messages.log
+
+  php:
+    build:
+      context: .
+      args:
+        - UID=${UID:-1000}
+        - GID=${GID:-1000}
+    container_name: php
+    restart: unless-stopped
+    volumes:
+      - ./:/var/www/html
+    working_dir: /var/www/html
+    depends_on:
+      - asterisk
+    command: composer up

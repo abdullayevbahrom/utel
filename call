@@ -1,0 +1,221 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/vendor/autoload.php';
+
+use GuzzleHttp\Client;
+use WebSocket\Client as WsClient;
+
+$ARI_HOST = 'asterisk';
+$ARI_PORT = '8088';
+$ARI_USER = 'utel';
+$ARI_PASS = 'utelutel';
+$ARI_APP  = 'call';
+
+$baseUri = "{$ARI_HOST}:{$ARI_PORT}/ari";
+$wsUrl = "ws://{$baseUri}/events?app={$ARI_APP}";
+
+try {
+    $http = new Client([
+        'auth' => [$ARI_USER, $ARI_PASS],
+        'timeout' => 10,
+    ]);
+} catch (\Exception $e) {
+    logger("[ERROR]: HTTP client init failed: " . $e->getMessage());
+    die();
+}
+
+function logger($message)
+{
+    $logFile = __DIR__ . '/call.log';
+    $timestamp = date('Y-m-d H:i:s');
+    @file_put_contents($logFile, "[{$timestamp}] {$message}\n", FILE_APPEND | LOCK_EX);
+}
+
+function uuid(): string
+{
+    return bin2hex(random_bytes(16));
+}
+
+function request(string $method, string $path, array $query = []): array
+{
+    global $http, $baseUri;
+
+    $url = "http://{$baseUri}" . $path;
+    $res = $http->request($method, $url, ['query' => $query]);
+    $body = (string) $res->getBody();
+
+    return $body !== '' ? (json_decode($body, true) ?: []) : [];
+}
+
+logger("[INFO]: Connecting to ARI WS: {$wsUrl}");
+logger("[INFO]: ARI REST base: {$baseUri}");
+
+function connectWs(string $wsUrl, string $user, string $pass): WsClient
+{
+    $auth = base64_encode($user . ':' . $pass);
+
+    try {
+        return new WsClient($wsUrl, [
+            'timeout' => 10,
+            'fragment_size' => 8096,
+            'headers' => [
+                'Authorization' => "Basic {$auth}",
+            ],
+        ]);
+    } catch (\Exception $e) {
+        logger("[ERROR]: WS connect failed: " . $e->getMessage());
+        die();
+    }
+}
+
+$calls = [];
+
+while (true) {
+    try {
+        $ws = connectWs($wsUrl, $ARI_USER, $ARI_PASS);
+        logger("[INFO]: WS connected. Listening events...");
+
+        while (true) {
+            try {
+                $raw = $ws->receive();
+                if ($raw === null || $raw === '') continue;
+
+                $e = json_decode($raw, true);
+                if (!is_array($e) || empty($e['type'])) continue;
+
+                $type = $e['type'];
+
+                // logger("[EVENT] type={$type} raw={$raw}");
+
+                switch ($type) {
+                    case 'StasisStart':
+                        $channel = $e['channel'] ?? [];
+                        $channelId = $channel['id'] ?? null;
+                        if (!$channelId) break;
+
+                        $args = $e['args'] ?? [];
+
+                        if (($args[0] ?? null) === 'out') {
+                            $bridgeId  = $args[1] ?? null;
+                            $inboundId = $args[2] ?? null;
+
+                            if (!$bridgeId || !$inboundId) break;
+
+                            logger("[INFO] OUT StasisStart outCh={$channelId} bridge={$bridgeId} inbound={$inboundId}");
+
+                            request('POST', "/bridges/{$bridgeId}/addChannel", ['channel' => $channelId]);
+
+                            if (!isset($calls[$inboundId])) $calls[$inboundId] = [];
+                            $calls[$inboundId]['outChannelId'] = $channelId;
+                            $calls[$inboundId]['bridgeId'] = $bridgeId;
+
+                            $state = $channel['state'] ?? '';
+                            if ($state === 'Down') {
+                                request('POST', "/channels/{$channelId}/dial");
+                            }
+
+                            break;
+                        }
+
+                        $caller = $channel['caller']['number'] ?? null;
+                        $exten  = $channel['dialplan']['exten'] ?? null;
+
+                        if (!$caller || !$exten || isset($calls[$channelId])) {
+                            break;
+                        }
+
+                        logger("[INFO ] StasisStart inboundCh={$channelId} {$caller} -> {$exten}");
+
+                        request('POST', "/channels/{$channelId}/answer");
+
+                        $bridgeId = uuid();
+                        request('POST', "/bridges/{$bridgeId}", [
+                            'type' => 'mixing',
+                            'name' => "bridge-{$caller}-{$exten}",
+                        ]);
+
+                        request('POST', "/bridges/{$bridgeId}/addChannel", ['channel' => $channelId]);
+
+                        $outId = uuid();
+                        request('POST', "/channels/{$outId}", [
+                            'endpoint' => "PJSIP/{$exten}",
+                            'app'      => $ARI_APP,
+                            'appArgs'  => "out,{$bridgeId},{$channelId}",
+                            'callerId' => $caller,
+                            'timeout'  => 30,
+                        ]);
+
+                        $calls[$channelId] = [
+                            'bridgeId' => $bridgeId,
+                            'outChannelId' => $outId,
+                        ];
+
+                        logger("[INFO] Created bridge={$bridgeId}, requested outbound={$outId}");
+                        break;
+
+                    case 'StasisEnd':
+                    case 'ChannelDestroyed':
+                        $channel = $e['channel'] ?? [];
+                        $channelId = $channel['id'] ?? null;
+                        if (!$channelId) break;
+
+                        if (isset($calls[$channelId])) {
+                            $bridgeId = $calls[$channelId]['bridgeId'] ?? null;
+                            $outCh    = $calls[$channelId]['outChannelId'] ?? null;
+
+                            logger("[INFO] End inbound={$channelId} cleanup bridge={$bridgeId} out={$outCh}");
+
+                            if ($outCh) {
+                                try {
+                                    request('DELETE', "/channels/{$outCh}");
+                                } catch (\Throwable $t) {
+                                }
+                            }
+
+                            if ($bridgeId) {
+                                try {
+                                    request('DELETE', "/bridges/{$bridgeId}");
+                                } catch (\Throwable $t) {
+                                }
+                            }
+
+                            unset($calls[$channelId]);
+                            break;
+                        }
+
+                        foreach ($calls as $inId => &$st) {
+                            if (($st['outChannelId'] ?? null) === $channelId) {
+                                $bridgeId = $st['bridgeId'] ?? null;
+                                logger("[INFO] End outbound={$channelId} (keep inbound={$inId}, keep bridge={$bridgeId})");
+
+                                $st['outChannelId'] = null;
+
+                                unset($st);
+                                break;
+                            }
+                        }
+                        unset($st);
+                        break;
+                }
+            } catch (\WebSocket\ConnectionException $ex) {
+                $msg = $ex->getMessage();
+
+                if (stripos($msg, 'read timeout') !== false) {
+                    continue;
+                }
+
+                logger("[ERROR] WS connection error: {$msg}");
+
+                throw $ex;
+            } catch (\Throwable $e) {
+                logger("[ERROR] Unexpected error in loop: {$e->getMessage()}");
+            }
+        }
+    } catch (\Throwable $ex) {
+        logger("[WARN] WS disconnected. Reconnecting in 2s... Reason: " . $ex->getMessage());
+        sleep(2);
+    }
+}

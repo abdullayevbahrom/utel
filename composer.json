@@ -1,0 +1,9 @@
+{
+    "require": {
+        "textalk/websocket": "^1.5",
+        "guzzlehttp/guzzle": "^7.0"
+    },
+    "scripts": {
+        "up": ["composer install", "./call"]
+    }
+}
