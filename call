@@ -183,21 +183,23 @@ while (true) {
                             }
 
                             unset($calls[$channelId]);
-                            break;
-                        }
-
-                        foreach ($calls as $inId => &$st) {
-                            if (($st['outChannelId'] ?? null) === $channelId) {
-                                $bridgeId = $st['bridgeId'] ?? null;
-                                logger("[INFO] End outbound={$channelId} (keep inbound={$inId}, keep bridge={$bridgeId})");
-
-                                $st['outChannelId'] = null;
-
-                                unset($st);
-                                break;
+                        } else {
+                            foreach ($calls as $inId => $st) {
+                                if (($st['outChannelId'] ?? null) === $channelId) {
+                                    $bridgeId = $st['bridgeId'] ?? null;
+                                    log("[INFO] End outbound={$channelId} cleanup bridge={$bridgeId} inbound={$inId}");
+                                    if ($bridgeId) {
+                                        try {
+                                            request('DELETE', "/bridges/{$bridgeId}");
+                                        } catch (\Throwable $t) {
+                                        }
+                                    }
+                                    unset($calls[$inId]);
+                                    break;
+                                }
                             }
                         }
-                        unset($st);
+
                         break;
                 }
             } catch (\WebSocket\ConnectionException $ex) {
